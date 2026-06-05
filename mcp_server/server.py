@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from .config import HOST, PORT, RRF_K
 from .database import Database
 from .embedder import embed_single, cosine_similarity
@@ -12,7 +13,15 @@ log = logging.getLogger("javadoc-mcp")
 
 
 def build_app() -> FastMCP:
-    mcp = FastMCP("javadoc-mcp-server")
+    mcp = FastMCP(
+        "javadoc-mcp-server",
+        host=HOST,
+        port=PORT,
+        streamable_http_path="/",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        ),
+    )
     db = Database()
     indexer = Indexer(db)
 
@@ -181,7 +190,7 @@ def main():
     mcp = build_app()
     app = mcp.streamable_http_app()
     log.info(f"Javadoc MCP server on {HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info", proxy_headers=True, forwarded_allow_ips=["*"])
 
 
 if __name__ == "__main__":
