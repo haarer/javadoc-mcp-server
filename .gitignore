@@ -13,3 +13,4 @@ data/*.db-shm
 .pytest_cache/
 *.onnx
 .hf_cache/
+.venv*

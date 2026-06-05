@@ -16,12 +16,15 @@ class Indexer:
     def __init__(self, db: Database):
         self.db = db
 
-    def index_jar(self, jar_path: str) -> tuple[int, str | None]:
+    def index_jar(self, jar_path: str, jar_name: str | None = None) -> tuple[int, str | None]:
         jar_path = os.path.abspath(jar_path)
         if not zipfile.is_zipfile(jar_path):
             return 0, f"Not a valid zip/jar: {jar_path}"
 
-        jar_id = self.db.add_jar(jar_path)
+        if jar_name is None:
+            jar_name = os.path.splitext(os.path.basename(jar_path))[0]
+
+        jar_id = self.db.add_jar(jar_name, jar_path)
         if not jar_id:
             return 0, "Failed to register jar"
 
@@ -53,8 +56,13 @@ class Indexer:
             count = 0
             batch: list[tuple] = []
             batch_size = 256
+            total_files = len(class_files)
 
-            for html_file in class_files:
+            for idx, html_file in enumerate(class_files):
+                if (idx + 1) % 100 == 0 or idx == 0:
+                    pct = (idx + 1) / total_files * 100
+                    log.info(f"Progress: {idx + 1}/{total_files} files ({pct:.0f}%), {count} symbols indexed so far")
+
                 rel = str(html_file).replace(tmpdir, "").lstrip("/")
                 try:
                     content = html_file.read_text(encoding="utf-8", errors="replace")
@@ -89,9 +97,6 @@ class Indexer:
                     self.db.insert_symbols_batch(jar_id, batch)
                     count += len(batch)
                     batch = []
-                    if count % 500 == 0:
-                        self.db.conn.commit()
-                        log.info(f"Indexed {count} symbols from {os.path.basename(jar_path)}")
 
             if batch:
                 self.db.insert_symbols_batch(jar_id, batch)

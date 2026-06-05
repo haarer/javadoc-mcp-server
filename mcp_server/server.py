@@ -1,11 +1,13 @@
 from __future__ import annotations
+import base64
 import logging
+import os
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from .config import HOST, PORT, RRF_K
+from .config import HOST, PORT, RRF_K, JARS_DIR
 from .database import Database
-from .embedder import embed_single, cosine_similarity
+from .embedder import embed_single, cosine_similarity, _detect_device
 from .indexer import Indexer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -13,6 +15,14 @@ log = logging.getLogger("javadoc-mcp")
 
 
 def build_app() -> FastMCP:
+    hint = _detect_device()
+    if hint == "cuda":
+        log.info("CUDA available — embeddings will run on GPU")
+    elif hint == "mps":
+        log.info("MPS available — embeddings will run on GPU")
+    else:
+        log.info("No GPU detected — embeddings will run on CPU")
+
     mcp = FastMCP(
         "javadoc-mcp-server",
         host=HOST,
@@ -66,7 +76,7 @@ def build_app() -> FastMCP:
         Args:
             query: search terms or natural language question
             limit: max results (default 10)
-            jar_filter: optional jar path to scope search
+            jar_filter: optional jar name to scope search
         """
         fts_results = db.fts_search(query, limit=limit * 3)
         fts_map = {r["fqn"]: (i, r) for i, r in enumerate(fts_results)}
@@ -124,7 +134,7 @@ def build_app() -> FastMCP:
     @mcp.tool()
     def list_packages(jar_filter: str | None = None) -> str:
         """List all packages in the indexed Javadoc.
-        Optionally filter by jar path.
+        Optionally filter by jar name.
         """
         jar_id = None
         if jar_filter:
@@ -142,7 +152,7 @@ def build_app() -> FastMCP:
 
         Args:
             package: fully qualified package name
-            jar_filter: optional jar path to scope results
+            jar_filter: optional jar name to scope results
         """
         jar_id = None
         if jar_filter:
@@ -160,28 +170,55 @@ def build_app() -> FastMCP:
         return "\n".join(lines)
 
     @mcp.tool()
-    def add_jar(path: str) -> str:
-        """Index a Javadoc JAR file containing standard Javadoc HTML.
+    def add_jar(name: str, content: str) -> str:
+        """Upload and index a Javadoc JAR file. The JAR content is base64-encoded.
 
         Args:
-            path: absolute or relative path to the .jar file
+            name: a unique name to identify this JAR (used by remove_jar and list_jars)
+            content: base64-encoded content of the .jar file
         """
-        count, error = indexer.index_jar(path)
+        os.makedirs(JARS_DIR, exist_ok=True)
+        jar_path = os.path.join(JARS_DIR, f"{name}.jar")
+        try:
+            raw = base64.b64decode(content)
+            with open(jar_path, "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            return f"Error decoding/saving jar: {e}"
+
+        count, error = indexer.index_jar(jar_path, jar_name=name)
         if error:
-            return f"Error indexing {path}: {error}"
-        return f"Indexed {count} symbols from {path}"
+            return f"Error indexing '{name}': {error}"
+        return f"Indexed {count} symbols from '{name}'"
 
     @mcp.tool()
-    def remove_jar(path: str) -> str:
+    def remove_jar(name: str) -> str:
         """Remove a previously indexed JAR and all its symbols.
 
         Args:
-            path: path of the jar to remove (must match path used in add_jar)
+            name: name of the jar to remove (as given in add_jar)
         """
-        count = db.remove_jar(path)
+        count, jar_path = db.remove_jar(name)
         if count == 0:
-            return f"Jar not found in index: {path}"
-        return f"Removed {count} symbols from {path}"
+            return f"Jar not found: {name}"
+        if jar_path and os.path.exists(jar_path):
+            os.remove(jar_path)
+        return f"Removed {count} symbols from '{name}'"
+
+    @mcp.tool()
+    def list_jars() -> str:
+        """List all indexed JAR files with their name, path, and symbol count."""
+        jars = db.list_jars()
+        if not jars:
+            return "No JARs indexed."
+        lines = [f"Indexed JARs ({len(jars)}):\n"]
+        for j in jars:
+            lines.append(f"  {j['name']}")
+            lines.append(f"    path:   {j['path']}")
+            lines.append(f"    added:  {j['added_at']}")
+            lines.append(f"    symbols: {j['symbol_count']}")
+            lines.append("")
+        return "\n".join(lines)
 
     return mcp
 

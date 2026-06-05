@@ -7,13 +7,13 @@ Python MCP server (Streamable HTTP transport) that indexes Javadoc JARs into SQL
 ## Decisions
 
 | Decision | Choice |
-|---|---|
+|---|---|---|
 | Javadoc source | Javadoc JARs (pre-built HTML) |
 | Multi-JAR | Dynamic add/remove at runtime |
 | Transport | Streamable HTTP |
-| Embeddings | Local ONNX (`all-MiniLM-L6-v2`) |
+| Embeddings | PyTorch (`all-MiniLM-L6-v2`) |
 | Storage | SQLite + FTS5 |
-| MCP tools | lookup, search, list, add_jar, remove_jar |
+| MCP tools | lookup_symbol, search_docs, list_packages, list_classes, add_jar, remove_jar, list_jars |
 
 ## Architecture
 
@@ -21,10 +21,10 @@ Python MCP server (Streamable HTTP transport) that indexes Javadoc JARs into SQL
 mcp_server/
   server.py          # MCP app, tool handlers, HTTP transport
   indexer.py         # JAR extraction, HTML parsing, FQN index
-  embedder.py        # ONNX embedding wrapper
+  embedder.py        # PyTorch embedding wrapper
   database.py        # SQLite schema, FTS5, query helpers
   parser.py          # BeautifulSoup Javadoc HTML -> structured JSON
-  config.py          # Settings (port, index path, model path)
+  config.py          # Settings (port, index path, jars dir, model, RRF k)
   requirements.txt
 ```
 
@@ -33,7 +33,8 @@ mcp_server/
 ```sql
 CREATE TABLE jars (
   id INTEGER PRIMARY KEY,
-  path TEXT UNIQUE NOT NULL,
+  name TEXT UNIQUE NOT NULL,
+  path TEXT NOT NULL,
   added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -61,7 +62,7 @@ CREATE UNIQUE INDEX idx_symbols_fqn ON symbols(fqn);
 
 ## Indexing flow
 
-1. `add_jar(path)` called
+1. `add_jar(name, content)` — base64-decoded JAR saved to `JARS_DIR/{name}.jar`
 2. Extract JAR to temp dir
 3. Read `element-list` for package list
 4. For each `*.html` file:
@@ -71,7 +72,7 @@ CREATE UNIQUE INDEX idx_symbols_fqn ON symbols(fqn);
    - Strip HTML tags -> plain text summary + description
    - Generate embedding for `summary + description`
    - Insert into `symbols`, trigger FTS5 update
-5. Register JAR path in `jars` table
+5. Register JAR with name in `jars` table
 6. Cleanup temp dir
 
 ## Parser details
@@ -79,9 +80,10 @@ CREATE UNIQUE INDEX idx_symbols_fqn ON symbols(fqn);
 Javadoc 21 HTML structure:
 - Class page: `class-declaration-page` body class
 - Class name: `<div class="block">` after class signature
-- Summary: `<div class="block">` in class description section
-- Members: `#member-summary` table, each row has name, signature, description
-- Method anchors: `#method-name(params)` pattern
+- Summary: `<div class="block">` in `<section class="class-description">`
+- Members: `#method-summary` table (`<div class="summary-table three-column-summary">`) with 3-column grid rows (col-first, col-second, col-last)
+- Method anchors: `#method-name(params)` pattern in `<section class="detail">`
+- Detail sections: `<section class="method-details" id="method-detail">` (same for field, constructor)
 
 Parse per-symbol, not per-file. Each method/field/constructor gets own row.
 
@@ -103,26 +105,30 @@ Distinct packages. Optional JAR filter.
 ### `list_classes(package: str, jar_filter: str = None)`
 Classes/interfaces/enums in package.
 
-### `add_jar(path: str)`
-Index a new JAR. Returns symbol count.
+### `add_jar(name: str, content: str)`
+Upload a JAR by base64-encoded content, index it. Returns symbol count.
 
-### `remove_jar(path: str)`
-Remove all symbols from JAR. Rebuild FTS5.
+### `remove_jar(name: str)`
+Remove a JAR and all its symbols by name. Deletes the stored file.
+
+### `list_jars()`
+List all indexed JARs with name, path, added_at, symbol count.
 
 ## Embedding pipeline
 
-- Model: `sentence-transformers/all-MiniLM-L6-v2` via `optimum[onnxruntime]`
+- Model: `sentence-transformers/all-MiniLM-L6-v2` via PyTorch
 - Embed at index time only
 - Store as `struct.pack` 384 floats -> BLOB
 - Query time: embed user query, compute cosine similarity in SQL using dot product
 - Batch embed 64 symbols per call for speed
+- GPU: auto-detects CUDA or MPS via PyTorch, falls back to CPU
 
 ## Dependencies
 
 ```
 mcp[streamable-http]    # MCP framework
 beautifulsoup4          # HTML parsing
-optimum[onnxruntime]    # Local embeddings
+torch + transformers     # Local embeddings
 sqlite3                 # stdlib, no install needed
 ```
 

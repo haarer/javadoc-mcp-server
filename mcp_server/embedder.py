@@ -1,20 +1,42 @@
 from __future__ import annotations
+import logging
 import struct
+import torch
 import numpy as np
 from .config import EMBED_MODEL, EMBED_BATCH_SIZE, EMBED_DIM
 
+log = logging.getLogger("javadoc-mcp.embedder")
+
 _model = None
 _tokenizer = None
+_device = None
+
+
+def _detect_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def _get_model():
-    global _model, _tokenizer
+    global _model, _tokenizer, _device
     if _model is None:
-        from optimum.onnxruntime import ORTModelForFeatureExtraction
-        from transformers import AutoTokenizer
-        _model = ORTModelForFeatureExtraction.from_pretrained(EMBED_MODEL)
-        _model.to("cpu")
+        from transformers import AutoModel, AutoTokenizer
+
+        _device = _detect_device()
+        _model = AutoModel.from_pretrained(EMBED_MODEL)
+        _model = _model.to(_device)
         _model.eval()
+
+        if _device == "cuda":
+            log.info(f"PyTorch CUDA detected — embeddings on GPU ({torch.cuda.get_device_name(0)})")
+        elif _device == "mps":
+            log.info("PyTorch MPS detected — embeddings on GPU")
+        else:
+            log.info("No GPU — embeddings on CPU")
+
         _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
     return _model, _tokenizer
 
@@ -28,7 +50,7 @@ def embed_batch(texts: list[str]) -> list[bytes]:
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i:i + EMBED_BATCH_SIZE]
         tokens = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
-        import torch
+        tokens = {k: v.to(_device) for k, v in tokens.items()}
         with torch.no_grad():
             out = model(**tokens)
         emb = out.last_hidden_state.mean(dim=1)

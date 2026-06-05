@@ -3,7 +3,7 @@ import sqlite3
 import os
 import re
 from typing import Any
-from .config import INDEX_PATH, INDEX_DIR
+from .config import INDEX_PATH, INDEX_DIR, JARS_DIR
 
 
 class Database:
@@ -21,7 +21,8 @@ class Database:
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS jars (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT UNIQUE NOT NULL,
+                name TEXT UNIQUE NOT NULL,
+                path TEXT NOT NULL,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -66,17 +67,26 @@ class Database:
         """)
         self.conn.commit()
 
-    def add_jar(self, path: str) -> int:
+    def add_jar(self, name: str, path: str) -> int:
         self.conn.execute(
-            "INSERT OR IGNORE INTO jars (path) VALUES (?)", (path,)
+            "INSERT OR IGNORE INTO jars (name, path) VALUES (?, ?)", (name, path)
         )
         self.conn.commit()
-        row = self.conn.execute("SELECT id FROM jars WHERE path = ?", (path,)).fetchone()
+        row = self.conn.execute("SELECT id FROM jars WHERE name = ?", (name,)).fetchone()
         return row[0] if row else 0
 
-    def get_jar_id(self, path: str) -> int | None:
-        row = self.conn.execute("SELECT id FROM jars WHERE path = ?", (path,)).fetchone()
+    def get_jar_id(self, name: str) -> int | None:
+        row = self.conn.execute("SELECT id FROM jars WHERE name = ?", (name,)).fetchone()
         return row[0] if row else None
+
+    def get_jar_by_name(self, name: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT id, name, path, added_at FROM jars WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return None
+        cols = ["id", "name", "path", "added_at"]
+        return dict(zip(cols, row))
 
     def insert_symbols_batch(self, jar_id: int, rows: list[tuple]):
         self.conn.executemany(
@@ -156,15 +166,28 @@ class Database:
         rows = self.conn.execute(sql, params).fetchall()
         return [{"fqn": r[0], "kind": r[1], "name": r[2], "summary": r[3]} for r in rows]
 
-    def remove_jar(self, path: str) -> int:
-        jar_id = self.get_jar_id(path)
-        if not jar_id:
-            return 0
+    def remove_jar(self, name: str) -> tuple[int, str | None]:
+        jar = self.get_jar_by_name(name)
+        if not jar:
+            return 0, f"Jar not found: {name}"
+        jar_id = jar["id"]
         count = self.conn.execute("SELECT count(*) FROM symbols WHERE jar_id = ?", (jar_id,)).fetchone()[0]
         self.conn.execute("DELETE FROM symbols WHERE jar_id = ?", (jar_id,))
         self.conn.execute("DELETE FROM jars WHERE id = ?", (jar_id,))
         self.conn.commit()
-        return count
+        return count, jar["path"]
+
+    def list_jars(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT j.id, j.name, j.path, j.added_at,
+                      (SELECT count(*) FROM symbols s WHERE s.jar_id = j.id) AS symbol_count
+               FROM jars j
+               ORDER BY j.added_at DESC"""
+        ).fetchall()
+        return [
+            {"id": r[0], "name": r[1], "path": r[2], "added_at": r[3], "symbol_count": r[4]}
+            for r in rows
+        ]
 
     def close(self):
         self.conn.close()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 import re
-from bs4 import BeautifulSoup, Tag
+import warnings
+from bs4 import BeautifulSoup, Tag, MarkupResemblesLocatorWarning
 from dataclasses import dataclass
+
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 
 @dataclass
@@ -23,7 +26,6 @@ def _strip_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["br", "li", "dt", "dd"]):
         tag.insert_before("\n")
-        tag.decompose()
     for tag in soup.find_all(True):
         tag.replace_with(tag.get_text())
     text = soup.get_text()
@@ -38,6 +40,14 @@ def _extract_block_text(parent: Tag | None, tag_name: str = "div", klass: str = 
     if not block:
         return ""
     return _strip_html(block.decode_contents())
+
+
+def _get_anchor_section(body: Tag, anchor_id: str) -> Tag | None:
+    el = body.find("section", id=anchor_id)
+    if el:
+        return el
+    el = body.find("div", id=anchor_id)
+    return el
 
 
 def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
@@ -70,11 +80,14 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     if not class_name:
         return []
 
-    # Strip generic type parameters from class name
     if "<" in class_name:
         class_name = class_name.split("<")[0].strip()
 
-    desc_section = body.find("div", class_="description")
+    # Javadoc 21: class-description is a <section>, not a <div>
+    desc_section = body.find("section", class_="class-description")
+    if not desc_section:
+        desc_section = body.find("div", class_="description")
+
     class_summary = _extract_block_text(desc_section)
     class_description = _extract_block_text(desc_section)
 
@@ -114,6 +127,26 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     return symbols
 
 
+def _get_detail_text(detail_section: Tag | None, method_name: str, kind: str) -> str:
+    if not detail_section:
+        return ""
+    if kind == "field":
+        sec = detail_section.find("section", id=method_name)
+        if sec:
+            block = sec.find("div", class_="block")
+            if block:
+                return _strip_html(block.decode_contents())
+        return ""
+    prefix = f"{method_name}("
+    for sec in detail_section.find_all("section", class_="detail"):
+        sec_id = sec.get("id", "")
+        if sec_id.startswith(prefix):
+            block = sec.find("div", class_="block")
+            if block:
+                return _strip_html(block.decode_contents())
+    return ""
+
+
 def _parse_member_section(
     body: Tag,
     summary_id: str,
@@ -124,15 +157,6 @@ def _parse_member_section(
     html_path: str,
 ) -> list[Symbol]:
     symbols: list[Symbol] = []
-    summary_table = body.find("section", id=summary_id)
-    detail_section = body.find("section", id=detail_id)
-
-    if not summary_table:
-        return symbols
-
-    summary_ul = summary_table.find("ul")
-    if not summary_ul:
-        return symbols
 
     member_kinds = {
         "field-summary": "field",
@@ -141,57 +165,58 @@ def _parse_member_section(
     }
     kind = member_kinds.get(summary_id, "method")
 
-    for li in summary_ul.find_all("li"):
-        name_el = li.find("span", class_="member-name")
-        if not name_el:
+    summary_section = body.find("section", id=summary_id)
+    if not summary_section:
+        return symbols
+
+    detail_section = body.find("section", id=detail_id)
+
+    summary_table = summary_section.find("div", class_="summary-table")
+    if not summary_table:
+        return symbols
+
+    for row in summary_table.find_all("div", class_="col-second"):
+        name_link = row.find("a", class_="member-name-link")
+        if not name_link:
             continue
-
-        member_name = ""
-        sig = ""
-
-        name_span = name_el.find("span", class_="member-name-link")
-        if name_span:
-            member_name = name_span.get_text(strip=True)
-
-        desc_div = name_el.find_next_sibling("div", class_="block")
-        member_summary = ""
-        if desc_div:
-            member_summary = _strip_html(desc_div.decode_contents())
-
-        if detail_section and member_name:
-            anchor_id = member_name.split("(")[0].replace("$", "_")
-            detail_li = detail_section.find("li", id=anchor_id)
-            if not detail_li:
-                detail_li = detail_section.find("li", id=f"_{anchor_id}")
-            if detail_li:
-                detail_block = detail_li.find("div", class_="block")
-                if detail_block:
-                    full_desc = _strip_html(detail_block.decode_contents())
-                    if full_desc and len(full_desc) > len(member_summary):
-                        member_summary = full_desc
-
+        member_name = name_link.get_text(strip=True)
         if not member_name:
             continue
 
         clean_name = member_name.split("(")[0].strip()
-        sig = name_el.get_text(strip=True)
+
+        # Get signature from the col-second content
+        sig = row.get_text(strip=True)
+
+        # Get description from the adjacent col-last
+        col_last = row.find_next_sibling("div", class_="col-last")
+        member_summary = ""
+        if col_last:
+            block = col_last.find("div", class_="block")
+            if block:
+                member_summary = _strip_html(block.decode_contents())
+
+        # Try to get full detail
+        full_desc = _get_detail_text(detail_section, clean_name, kind)
+        if not full_desc:
+            full_desc = member_summary
 
         if kind == "method":
-            fqn = f"{parent_fqn}#{clean_name}"
+            fqn_str = f"{parent_fqn}#{clean_name}"
         elif kind == "constructor":
-            fqn = f"{parent_fqn}#<init>"
+            fqn_str = f"{parent_fqn}#<init>"
             clean_name = parent_fqn.split(".")[-1]
         else:
-            fqn = f"{parent_fqn}#{clean_name}"
+            fqn_str = f"{parent_fqn}#{clean_name}"
 
         sym = Symbol(
-            fqn=fqn,
+            fqn=fqn_str,
             kind=kind,
             name=clean_name,
             package=package,
             signature=sig,
             summary=member_summary[:500] if member_summary else None,
-            description=member_summary,
+            description=full_desc,
             html_path=html_path,
             source_jar=jar_path,
         )
