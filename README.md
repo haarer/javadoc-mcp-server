@@ -22,7 +22,7 @@ Uses PyTorch — if CUDA is available, it auto-detects and runs embeddings on GP
 ## Environment variables
 
 | Variable | Default | Description |
-|---|---|---|---|
+|---|---|---|
 | `JAVADOC_MCP_HOST` | `0.0.0.0` | Bind address |
 | `JAVADOC_MCP_PORT` | `8600` | Port |
 | `JAVADOC_INDEX_DIR` | `./data` | Index storage directory |
@@ -34,7 +34,7 @@ Uses PyTorch — if CUDA is available, it auto-detects and runs embeddings on GP
 ## MCP tools
 
 | Tool | Description |
-|---|---|---|
+|---|---|
 | `lookup_symbol(fqn)` | Exact FQN lookup. Returns name, kind, summary, description. |
 | `search_docs(query, limit, jar_filter)` | Hybrid BM25 + vector search with reciprocal rank fusion. |
 | `list_packages(jar_filter)` | List all indexed packages. |
