@@ -6,6 +6,9 @@ import os
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.routing import Route
+from starlette.responses import JSONResponse
 from .config import HOST, PORT, RRF_K, JARS_DIR, EMBED_API_URL, EMBED_MODEL, EMBED_DIM
 from .database import Database
 from .embedder import embed_single, cosine_similarity
@@ -149,15 +152,8 @@ def build_app() -> FastMCP:
                 lines.append(f"    {s}")
         return "\n".join(lines)
 
-    @mcp.tool()
-    def add_jar(name: str, content: str) -> str:
-        """Upload and index a Javadoc JAR file. Content must be base64-encoded."""
+    def do_index(raw: bytes, name: str) -> str:
         os.makedirs(JARS_DIR, exist_ok=True)
-        try:
-            raw = base64.b64decode(content)
-        except Exception as e:
-            return f"Error decoding jar content: {e}"
-
         file_hash = hashlib.sha256(raw).hexdigest()
         jar_path = os.path.join(JARS_DIR, f"{file_hash}.jar")
 
@@ -176,6 +172,11 @@ def build_app() -> FastMCP:
         return f"Indexed {count} symbols from '{name}'"
 
     @mcp.tool()
+    def add_jar(name: str) -> str:
+        """Upload and index a Javadoc JAR file. For binary JAR upload, POST multipart/form-data to the server's /upload-jar endpoint (field: 'jar', optional field: 'name'). Example: curl -F jar=@file.jar -F name=myjar http://host:port/upload-jar. Returns symbol count. Verify success by calling list_jars afterward."""
+        return "Use the /upload-jar HTTP endpoint to upload a JAR file. POST multipart/form-data with field 'jar' (binary file) and optional field 'name'."
+
+    @mcp.tool()
     def remove_jar(name: str) -> str:
         """Remove a previously indexed JAR and all its symbols."""
         count, jar_path = db.remove_jar(name)
@@ -187,7 +188,7 @@ def build_app() -> FastMCP:
 
     @mcp.tool()
     def list_jars() -> str:
-        """List all indexed JAR files with name, hash, and symbol count."""
+        """List all indexed JAR files with name, hash, and symbol count. Use after add_jar to verify upload succeeded (symbol_count must be > 0)."""
         jars = db.list_jars()
         if not jars:
             return "No JARs indexed."
@@ -200,12 +201,47 @@ def build_app() -> FastMCP:
             lines.append("")
         return "\n".join(lines)
 
-    return mcp
+    async def upload_jar(request: Request) -> JSONResponse:
+        form = await request.form()
+        jar_file = form.get("jar")
+        name = form.get("name", "uploaded-jar")
+
+        if not jar_file:
+            return JSONResponse({"error": "No 'jar' field in form data. Use: curl -F jar=@file.jar http://host:port/upload-jar"}, status_code=400)
+
+        raw = await jar_file.read()
+        if not raw:
+            return JSONResponse({"error": "Empty file"}, status_code=400)
+
+        # Parse name: prefer form field, fallback to filename
+        if not name or name.strip() == "":
+            name = jar_file.filename or "uploaded-jar"
+            name = os.path.splitext(name)[0]
+
+        result = do_index(raw, name)
+
+        if "Error" in result or "already indexed" in result:
+            return JSONResponse({"error": result}, status_code=400)
+
+        return JSONResponse({"status": "ok", "message": result})
+
+    async def upload_redirect(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "message": "Upload a JAR file to POST /upload-jar",
+            "example": "curl -F jar=@file.jar -F name=myjar http://host:port/upload-jar"
+        })
+
+    mcp_app = mcp.streamable_http_app()
+
+    # Add upload routes directly to the MCP app's router
+    mcp_app.routes.append(Route("/upload-jar", upload_jar, methods=["POST"]))
+    mcp_app.routes.append(Route("/upload-jar", upload_redirect, methods=["GET"]))
+
+    return mcp_app
 
 
 def main():
-    mcp = build_app()
-    app = mcp.streamable_http_app()
+    app = build_app()
     log.info(f"Javadoc MCP server on {HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info", proxy_headers=True, forwarded_allow_ips=["*"])
 
