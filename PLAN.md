@@ -14,7 +14,7 @@ Python MCP server (Streamable HTTP transport) that indexes Javadoc JARs into SQL
 | Embeddings | OpenAPI-compatible `/v1/embeddings` endpoint (llama.cpp, OpenAI, vLLM, ...) |
 | Storage | SQLite + FTS5 |
 | JAR storage | SHA-256 hash as filename, user-facing name in DB |
-| MCP tools | lookup_symbol, search_docs, list_packages, list_classes, add_jar, remove_jar, list_jars |
+| MCP tools | lookup_symbol, search_docs, list_packages, list_classes, add_jar, remove_jar, list_jars, jar_status |
 
 ## Architecture
 
@@ -36,6 +36,9 @@ CREATE TABLE jars (
   name TEXT NOT NULL,
   path TEXT NOT NULL,
   file_hash TEXT UNIQUE,
+  status TEXT DEFAULT 'indexed' CHECK(status IN ('indexing', 'indexed', 'failed')),
+  symbols_indexed INTEGER DEFAULT 0,
+  error_message TEXT,
   added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -67,16 +70,27 @@ CREATE UNIQUE INDEX idx_symbols_fqn ON symbols(fqn);
 
 1. `add_jar(name, content)` — base64-decoded, SHA-256 hash computed
 2. JAR saved to `JARS_DIR/{hash}.jar` (duplicate detection by hash)
-3. Extract JAR to temp dir
-4. For each `*.html` file:
-   - Parse with BeautifulSoup
-   - Extract: class/interface name, package, members (fields, constructors, methods)
-   - Build FQN: `package.ClassName` for types, `package.ClassName#method(params)` for members
-   - Strip HTML tags -> plain text summary + description
-   - Generate embedding for `kind + fqn + summary + description` via OpenAPI endpoint
-   - Insert into `symbols`, trigger FTS5 update
-5. Register JAR with user-facing name and hash in `jars` table
-6. Cleanup temp dir
+3. DB row inserted with `status='indexing'`, `symbols_indexed=0`
+4. `add_jar` returns immediately with `status: "indexing"`
+5. Background task runs indexing:
+   - Extract JAR to temp dir
+   - For each `*.html` file:
+     - Parse with BeautifulSoup
+     - Extract: class/interface name, package, members (fields, constructors, methods)
+     - Build FQN: `package.ClassName` for types, `package.ClassName#method(params)` for members
+     - Strip HTML tags -> plain text summary + description (truncated to 500 chars max)
+     - Generate embedding for `kind + fqn + summary + description` via OpenAPI endpoint
+     - Insert into `symbols`, trigger FTS5 update
+     - Every 100 files: `update_progress(jar_id, count)`
+   - On success: `finish_indexing(jar_id, total_count)`
+   - On failure: `finish_indexing(jar_id, count, error_msg)`
+   - Cleanup temp dir
+
+### Embedding pipeline notes
+- Texts are truncated before embedding (summary≤100, desc≤200, total≤500 chars) to avoid API token limits
+- Batch size: 8 (reduced from 64 to avoid 500 errors from embedding server)
+- On 500 error: recursive split-half retry until batch size = 1
+- Progress reported to DB every 100 files; final status on completion/failure
 
 ## Parser details
 
@@ -109,13 +123,16 @@ Distinct packages. Optional JAR filter by name.
 Classes/interfaces/enums in package. Optional JAR filter.
 
 ### `add_jar(name: str, content: str)`
-Upload a JAR by base64-encoded content. File stored as `{sha256}.jar`. Duplicate detection by content hash. Returns symbol count.
+Upload a JAR by base64-encoded content. File stored as `{sha256}.jar`. Duplicate detection by content hash. Returns immediately with `status: "indexing"`. Same-name re-upload replaces old JAR.
 
 ### `remove_jar(name: str)`
-Remove a JAR and all its symbols by name. Deletes the stored file on disk.
+Remove a JAR and all its symbols by name. Deletes the stored file on disk. Cannot remove JARs currently indexing.
 
 ### `list_jars()`
-List all indexed JARs with name, hash, added_at, symbol count.
+List all indexed JARs with name, hash, added_at, symbol count, status, and error message.
+
+### `jar_status(name: str)`
+Check indexing status of a JAR. Returns `status` (`indexing`, `indexed`, `failed`), `symbols_indexed`, and `error_message`.
 
 ## Embedding pipeline
 
@@ -123,8 +140,9 @@ List all indexed JARs with name, hash, added_at, symbol count.
 - Default model: `bge-large-en-v1.5` via llama.cpp (1024 dim)
 - Embed at index time only, store as `struct.pack` floats -> BLOB
 - Query time: embed user query via same API, compute cosine similarity in Python
-- Batch embed up to 64 symbols per API call
+- Batch embed up to 8 symbols per API call (reduced from 64 to avoid token limit)
 - Cosine similarity: pure Python dot product (no numpy dependency)
+- Recursive split-half retry on 500 errors
 
 ## Dependencies
 
@@ -144,11 +162,21 @@ sqlite3                 # stdlib, no install needed
 
 ## Next steps
 
-1. Scaffold project, install deps
-2. Implement SQLite schema + database module
-3. Build Javadoc HTML parser
-4. Wire up OpenAPI embedder
-5. Implement indexer pipeline
-6. Create MCP tool handlers
-7. Test with MagicDraw JAR
+1. ~~Scaffold project, install deps~~ **DONE**
+2. ~~Implement SQLite schema + database module~~ **DONE**
+3. ~~Build Javadoc HTML parser~~ **DONE**
+4. ~~Wire up OpenAPI embedder~~ **DONE**
+5. ~~Implement indexer pipeline~~ **DONE**
+6. ~~Create MCP tool handlers~~ **DONE**
+7. ~~Test with MagicDraw JAR~~ **DONE**
 8. Load test, tune
+
+## Implemented features
+
+- Background indexing: `add_jar` returns immediately, indexing runs in background
+- Progress tracking: `jar_status` tool shows current status, symbol count, errors
+- Graceful query responses: search/lookup show "indexing in progress" note during indexing
+- Duplicate detection: same hash rejected; same-name re-upload replaces old JAR
+- Embedding resilience: text truncation, reduced batch size (8), recursive split on 500
+- Schema migration: safe ALTER TABLE adds `status`, `symbols_indexed`, `error_message` columns
+- Silent embedder: no per-call logging, only errors/warnings

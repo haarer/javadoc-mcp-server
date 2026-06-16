@@ -72,7 +72,7 @@ uv run javadoc-mcp
 | `JAVADOC_EMBED_API_KEY` | *(none)* | Bearer token for API auth |
 | `JAVADOC_EMBED_MODEL` | `bge-large-en-v1.5` | Model name sent to API |
 | `JAVADOC_EMBED_DIM` | `1024` | Embedding vector dimension |
-| `JAVADOC_EMBED_BATCH` | `64` | Embedding batch size |
+| `JAVADOC_EMBED_BATCH` | `8` | Embedding batch size (reduced to avoid API token limit errors) |
 
 ## MCP tools
 
@@ -82,9 +82,10 @@ uv run javadoc-mcp
 | `search_docs(query, limit, jar_filter)` | Search indexed Javadoc by keyword or natural language query. |
 | `list_packages(jar_filter)` | List all packages. Optionally filter by jar name. |
 | `list_classes(package, jar_filter)` | List classes, interfaces, and enums in a package. |
-| `add_jar(name, content)` | Upload and index a Javadoc JAR. Content must be base64-encoded. File stored by SHA-256 hash; duplicate detection prevents re-indexing. |
-| `remove_jar(name)` | Remove a previously indexed JAR and all its symbols. |
-| `list_jars()` | List all indexed JARs with name, hash, and symbol count. |
+| `add_jar(name, content)` | Upload and index a Javadoc JAR. Content must be base64-encoded. Returns immediately with `status: "indexing"`; indexing runs in background. Use `jar_status(name)` to check progress. Duplicate hash detection prevents re-indexing. Same-name re-upload replaces old JAR. |
+| `remove_jar(name)` | Remove a previously indexed JAR and all its symbols. Cannot remove JARs currently indexing. |
+| `list_jars()` | List all indexed JARs with name, hash, symbol count, status, and error message. |
+| `jar_status(name)` | Check indexing status of a JAR. Returns `status` (`indexing`, `indexed`, `failed`), `symbols_indexed`, and `error_message`. |
 
 ## Hybrid search
 
@@ -99,16 +100,25 @@ Each indexed symbol stores: FQN, kind, name, package, signature, summary, full d
 
 JAR files are stored by SHA-256 hash of their content. The user-facing name is tracked in the `jars` table. This prevents duplicate uploads of the same file under different names.
 
+### Background indexing
+
+`add_jar` returns immediately with `status: "indexing"`. The actual indexing runs as a background task. Use `jar_status(name)` to check progress:
+- `indexing` — in progress, `symbols_indexed` shows count so far
+- `indexed` — complete, `symbols_indexed` shows total count
+- `failed` — error occurred, `error_message` contains details
+
+While a JAR is indexing, search and lookup tools still work but show a note that indexing is in progress. You cannot remove a JAR while it's indexing.
+
 ## Architecture
 
 ```
 mcp_server/
-  server.py       # MCP app, 7 tool handlers, uvicorn HTTP
-  indexer.py      # JAR extraction, HTML parsing, embedding pipeline
-  embedder.py     # OpenAPI HTTP client for embeddings
-  database.py     # SQLite schema, FTS5, vector queries
+  server.py       # MCP app, 8 tool handlers, background indexing, uvicorn HTTP
+  indexer.py      # JAR extraction, HTML parsing, embedding pipeline, progress reporting
+  embedder.py     # OpenAPI HTTP client for embeddings (silent, recursive 500 retry)
+  database.py     # SQLite schema, FTS5, vector queries, indexing status tracking
   parser.py       # BeautifulSoup Javadoc HTML -> structured data
-  config.py       # Settings (port, index path, API URL, model, RRF k)
+  config.py       # Settings (port, index path, API URL, model, RRF k, batch size)
 ```
 
 ## Dependencies

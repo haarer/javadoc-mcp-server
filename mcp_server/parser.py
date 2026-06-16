@@ -1,9 +1,11 @@
 from __future__ import annotations
+import logging
 import re
 import warnings
 from bs4 import BeautifulSoup, Tag, MarkupResemblesLocatorWarning
 from dataclasses import dataclass
 
+log = logging.getLogger("javadoc-mcp.parser")
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 
@@ -54,6 +56,7 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     soup = BeautifulSoup(html, "html.parser")
     body = soup.body
     if not body:
+        log.debug(f"[parser] No body found in {html_path}")
         return []
 
     page_class = body.get("class", [])
@@ -62,6 +65,7 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     is_enum = "enum-declaration-page" in page_class
 
     if not (is_class or is_interface or is_enum):
+        log.debug(f"[parser] Not a class/interface/enum page: {html_path} (classes: {page_class})")
         return []
 
     kind = "enum" if is_enum else "interface" if is_interface else "class"
@@ -78,6 +82,7 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
         class_name = raw
 
     if not class_name:
+        log.debug(f"[parser] No class name found in {html_path}")
         return []
 
     if "<" in class_name:
@@ -124,6 +129,7 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     symbols.extend(constructors)
     symbols.extend(methods)
 
+    log.info(f"[parser] Parsed {len(symbols)} symbols from {fqn} ({kind}) in {html_path}")
     return symbols
 
 

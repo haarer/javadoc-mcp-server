@@ -21,6 +21,13 @@ def _get_headers() -> dict[str, str]:
 def _embed_batch_api(texts: list[str]) -> list[list[float]]:
     payload = {"model": EMBED_MODEL, "input": texts}
     resp = httpx.post(EMBED_API_URL, json=payload, headers=_get_headers(), timeout=60)
+    if resp.status_code == 500:
+        log.warning(f"[embedder] Got 500 from API, retrying with half batch size (splitting {len(texts)} into smaller batches)")
+        mid = len(texts) // 2
+        if mid == 0:
+            log.error(f"[embedder] Single text too large for API: {texts[0][:100]}...")
+            return []
+        return _embed_batch_api(texts[:mid]) + _embed_batch_api(texts[mid:])
     resp.raise_for_status()
     data = resp.json()
     return [e["embedding"] for e in data["data"]]
