@@ -1,12 +1,23 @@
 from __future__ import annotations
 import logging
 import sqlite3
+import struct
 import os
 import re
 from typing import Any
-from .config import INDEX_PATH, INDEX_DIR, JARS_DIR
+from .config import INDEX_PATH, INDEX_DIR, JARS_DIR, EMBED_DIM
 
 log = logging.getLogger("javadoc-mcp.database")
+
+
+def _load_vec_extension(conn):
+    try:
+        import sqlite_vec
+        sqlite_vec.load(conn)
+        return True
+    except Exception as e:
+        log.warning(f"[database] sqlite-vec extension not available: {e}")
+        return False
 
 
 class Database:
@@ -16,14 +27,22 @@ class Database:
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
         log.info(f"[database] Opening SQLite database at {db_path}")
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA cache_size=-64000")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA mmap_size=268435456")
+        self.conn.execute("PRAGMA busy_timeout=30000")
+
+        self.has_vec = _load_vec_extension(self.conn)
         self._init_schema()
-        log.info(f"[database] Schema initialized, DB size={os.path.getsize(db_path) if os.path.exists(db_path) else 0} bytes")
+        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        log.info(f"[database] Schema initialized, DB size={db_size} bytes, sqlite_vec={self.has_vec}")
 
     def _init_schema(self):
-        self.conn.executescript("""
+        self.conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS jars (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -76,20 +95,16 @@ class Database:
                 VALUES (new.id, new.fqn, new.name, new.package, new.summary, new.description);
             END;
         """)
-        # Migrate existing jars that don't have new columns
+        for col in ["status", "symbols_indexed", "error_message"]:
+            try:
+                self.conn.execute(f"ALTER TABLE jars ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
+        # Ensure embedding column exists
         try:
-            self.conn.execute("ALTER TABLE jars ADD COLUMN status TEXT")
+            self.conn.execute("ALTER TABLE symbols ADD COLUMN embedding BLOB")
         except sqlite3.OperationalError:
             pass
-        try:
-            self.conn.execute("ALTER TABLE jars ADD COLUMN symbols_indexed INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            self.conn.execute("ALTER TABLE jars ADD COLUMN error_message TEXT")
-        except sqlite3.OperationalError:
-            pass
-        # Set status for existing jars based on symbol count
         self.conn.execute("""
             UPDATE jars SET status = CASE WHEN symbols_indexed > 0 THEN 'indexed'
                                           WHEN status IS NULL THEN 'indexed'
@@ -105,11 +120,12 @@ class Database:
         )
         self.conn.commit()
 
-    def update_progress(self, jar_id: int, symbols_count: int):
+    def update_progress(self, jar_id: int, symbols_count: int, commit: bool = True):
         self.conn.execute(
             "UPDATE jars SET symbols_indexed = ? WHERE id = ?", (symbols_count, jar_id)
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def finish_indexing(self, jar_id: int, total_symbols: int, error: str | None = None):
         status = "failed" if error else "indexed"
@@ -146,10 +162,8 @@ class Database:
             if existing_hash == file_hash:
                 log.info(f"[database] Jar '{name}' already exists with same hash, returning existing id={existing_id}")
                 return existing_id
-            # Same name, different hash -> clean up old entry and symbols
-            log.warning(f"[database] Jar '{name}' exists with different hash ({existing_hash[:16]} vs {file_hash[:16]}). Replacing.")
-            self.conn.execute("DELETE FROM symbols WHERE jar_id = ?", (existing_id,))
-            self.conn.execute("DELETE FROM jars WHERE id = ?", (existing_id,))
+            log.warning(f"[database] Jar '{name}' exists with different hash. Replacing.")
+            self._remove_jar_data(existing_id)
             self.conn.commit()
         self.conn.execute(
             "INSERT INTO jars (name, path, file_hash, status, symbols_indexed) VALUES (?, ?, ?, 'indexing', 0)", (name, path, file_hash)
@@ -159,6 +173,10 @@ class Database:
         jar_id = row[0] if row else 0
         log.info(f"[database] add_jar returned jar_id={jar_id}")
         return jar_id
+
+    def _remove_jar_data(self, jar_id: int):
+        self.conn.execute("DELETE FROM symbols WHERE jar_id = ?", (jar_id,))
+        self.conn.execute("DELETE FROM jars WHERE id = ?", (jar_id,))
 
     def get_jar_id(self, name: str) -> int | None:
         row = self.conn.execute("SELECT id FROM jars WHERE name = ?", (name,)).fetchone()
@@ -227,65 +245,117 @@ class Database:
         return [dict(zip(cols, r)) for r in rows]
 
     def vector_search(self, query_embedding: bytes, limit: int = 100, jar_id: int | None = None) -> list[dict[str, Any]]:
+        """Search using sqlite-vec KNN if available, else fallback to Python cosine."""
+        if self.has_vec:
+            return self._vector_search_vec(query_embedding, limit, jar_id)
+        return self._vector_search_python(query_embedding, limit, jar_id)
+
+    def _vector_search_vec(self, query_embedding: bytes, limit: int, jar_id: int | None) -> list[dict[str, Any]]:
+        emb = struct.unpack(f"{EMBED_DIM}f", query_embedding)
+        emb_blob = struct.pack(f"{EMBED_DIM}f", *emb)
+
         rows = self.conn.execute(
             """SELECT s.id, s.fqn, s.kind, s.name, s.package, s.summary, s.description,
+                      j.path as jar_path, v.distance
+               FROM symbol_embeddings v
+               JOIN symbols s ON v.rowid = s.id
+               JOIN jars j ON s.jar_id = j.id
+               WHERE v.embedding MATCH ?
+               ORDER BY v.distance
+               LIMIT ?""",
+            (emb_blob, limit)
+        ).fetchall()
+        cols = ["id", "fqn", "kind", "name", "package", "summary", "description", "jar_path", "distance"]
+        results = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["similarity"] = 1.0 - d["distance"]
+            results.append(d)
+        return results
+
+    def _vector_search_python(self, query_embedding: bytes, limit: int, jar_id: int | None) -> list[dict[str, Any]]:
+        import numpy as np
+        q = np.frombuffer(query_embedding, dtype=np.float32)
+        q_norm = np.linalg.norm(q)
+        if q_norm == 0:
+            return []
+
+        base_sql = """SELECT s.id, s.fqn, s.kind, s.name, s.package, s.summary, s.description,
                       j.path as jar_path, s.embedding
                FROM symbols s
                JOIN jars j ON s.jar_id = j.id
-               WHERE s.embedding IS NOT NULL AND length(s.embedding) > 0""",
-        ).fetchall()
+               WHERE s.embedding IS NOT NULL AND length(s.embedding) > 0"""
+        params: list[Any] = []
         if jar_id is not None:
-            rows = [r for r in rows
-                    if self.conn.execute(
-                        "SELECT jar_id FROM symbols WHERE id=?", (r[0],)
-                    ).fetchone()[0] == jar_id]
-        return rows
+            base_sql += " AND s.jar_id = ?"
+            params.append(jar_id)
+
+        all_rows = self.conn.execute(base_sql, params).fetchall()
+        cols = ["id", "fqn", "kind", "name", "package", "summary", "description", "jar_path", "embedding"]
+
+        scored = []
+        for r in all_rows:
+            d = dict(zip(cols, r))
+            emb_bytes = d.pop("embedding")
+            doc = np.frombuffer(emb_bytes, dtype=np.float32)
+            d_norm = np.linalg.norm(doc)
+            if d_norm == 0:
+                continue
+            sim = float(np.dot(q, doc) / (q_norm * d_norm))
+            d["similarity"] = sim
+            scored.append(d)
+
+        scored.sort(key=lambda x: -x["similarity"])
+        return scored[:limit]
 
     def list_packages(self, jar_id: int | None = None) -> list[str]:
-        sql = "SELECT DISTINCT package FROM symbols WHERE kind IN ('class','interface','enum')"
-        params: list = []
+        base_sql = """SELECT DISTINCT s.package
+               FROM symbols s
+               JOIN jars j ON s.jar_id = j.id
+               WHERE j.status = 'indexed'"""
+        params: list[Any] = []
         if jar_id is not None:
-            sql += " AND jar_id = ?"
+            base_sql += " AND s.jar_id = ?"
             params.append(jar_id)
-        sql += " ORDER BY package"
-        rows = self.conn.execute(sql, params).fetchall()
-        return [r[0] for r in rows]
+        base_sql += " ORDER BY s.package"
+        return [r[0] for r in self.conn.execute(base_sql, params).fetchall()]
 
     def list_classes(self, package: str, jar_id: int | None = None) -> list[dict[str, Any]]:
-        sql = """SELECT fqn, kind, name, summary FROM symbols
-                 WHERE package = ? AND kind IN ('class','interface','enum')"""
-        params = [package]
+        base_sql = """SELECT s.name, s.kind, s.summary, s.fqn
+               FROM symbols s
+               JOIN jars j ON s.jar_id = j.id
+               WHERE s.package = ? AND j.status = 'indexed' AND s.kind IN ('class', 'interface', 'enum')"""
+        params: list[Any] = [package]
         if jar_id is not None:
-            sql += " AND jar_id = ?"
+            base_sql += " AND s.jar_id = ?"
             params.append(jar_id)
-        sql += " ORDER BY name"
-        rows = self.conn.execute(sql, params).fetchall()
-        return [{"fqn": r[0], "kind": r[1], "name": r[2], "summary": r[3]} for r in rows]
+        base_sql += " ORDER BY s.name"
+        rows = self.conn.execute(base_sql, params).fetchall()
+        cols = ["name", "kind", "summary", "fqn"]
+        return [dict(zip(cols, r)) for r in rows]
 
-    def remove_jar(self, name: str) -> tuple[int, str | None]:
+    def remove_jar(self, name: str) -> tuple[int, str]:
         jar = self.get_jar_by_name(name)
         if not jar:
-            return 0, f"Jar not found: {name}"
-        jar_id = jar["id"]
-        if jar["status"] == "indexing":
-            return 0, f"Cannot remove '{name}' while indexing is in progress"
-        count = self.conn.execute("SELECT count(*) FROM symbols WHERE jar_id = ?", (jar_id,)).fetchone()[0]
-        self.conn.execute("DELETE FROM symbols WHERE jar_id = ?", (jar_id,))
-        self.conn.execute("DELETE FROM jars WHERE id = ?", (jar_id,))
+            return 0, ""
+        if jar.get("status") == "indexing":
+            return 0, f"Jar '{name}' is currently being indexed. Wait for completion before removing."
+        count = self._get_symbol_count(jar["id"])
+        self._remove_jar_data(jar["id"])
         self.conn.commit()
-        return count, jar["path"]
+        return count, jar.get("path", "")
+
+    def _get_symbol_count(self, jar_id: int) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM symbols WHERE jar_id = ?", (jar_id,)).fetchone()
+        return row[0] if row else 0
 
     def list_jars(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            """SELECT j.id, j.name, j.path, j.file_hash, j.status, j.symbols_indexed, j.error_message, j.added_at,
+            """SELECT j.id, j.name, j.path, j.file_hash, j.status, j.symbols_indexed,
+                      j.error_message, j.added_at,
                       (SELECT count(*) FROM symbols s WHERE s.jar_id = j.id) AS symbol_count
                FROM jars j
                ORDER BY j.added_at DESC"""
         ).fetchall()
-        return [
-            {"id": r[0], "name": r[1], "path": r[2], "file_hash": r[3], "status": r[4], "symbols_indexed": r[5], "error_message": r[6], "added_at": r[7], "symbol_count": r[8]}
-            for r in rows
-        ]
-
-    def close(self):
-        self.conn.close()
+        cols = ["id", "name", "path", "file_hash", "status", "symbols_indexed", "error_message", "added_at", "symbol_count"]
+        return [dict(zip(cols, r)) for r in rows]

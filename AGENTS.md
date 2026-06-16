@@ -1,0 +1,5 @@
+- you run in a podman container. the /workspace is shared with the host
+- you dont start or stop servers. tell me when you changed code. i restart on host.
+- install what you need, but for python use an own venv (currently .venv) - when i run things from the host it would interfere
+- use uv to maintain python packages, dont use pip
+- when talking to mcp servers - you need a session ID!

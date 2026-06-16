@@ -11,6 +11,6 @@ PORT = int(os.environ.get("JAVADOC_MCP_PORT", "8600"))
 EMBED_API_URL = os.environ.get("JAVADOC_EMBED_API_URL", "http://localhost:8000/v1/embeddings")
 EMBED_API_KEY = os.environ.get("JAVADOC_EMBED_API_KEY", "")
 EMBED_MODEL = os.environ.get("JAVADOC_EMBED_MODEL", "bge-large-en-v1.5")
-EMBED_BATCH_SIZE = int(os.environ.get("JAVADOC_EMBED_BATCH", "8"))
+EMBED_BATCH_SIZE = int(os.environ.get("JAVADOC_EMBED_BATCH", "256"))
 EMBED_DIM = int(os.environ.get("JAVADOC_EMBED_DIM", "1024"))
 RRF_K = 60

@@ -12,7 +12,6 @@ from starlette.routing import Route
 from starlette.responses import JSONResponse
 from .config import HOST, PORT, RRF_K, JARS_DIR, EMBED_API_URL, EMBED_MODEL, EMBED_DIM, EMBED_BATCH_SIZE, INDEX_PATH, INDEX_DIR
 from .database import Database
-from .embedder import embed_single, cosine_similarity
 from .indexer import Indexer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -46,7 +45,6 @@ def build_app() -> FastMCP:
     @mcp.tool()
     def lookup_symbol(fqn: str) -> str:
         """Look up documentation for a specific symbol by fully qualified name (e.g. com.example.MyClass)."""
-        # Check if any jar is still indexing
         indexing_jars = db.get_indexing_jars()
         result = db.lookup_symbol(fqn)
         if not result:
@@ -88,23 +86,11 @@ def build_app() -> FastMCP:
         if jar_filter:
             jar_id = db.get_jar_id(jar_filter)
 
+        from .embedder import embed_single
         q_emb = embed_single(query)
-        vec_rows = db.vector_search(q_emb, limit=limit * 3, jar_id=jar_id)
+        vec_results = db.vector_search(q_emb, limit=limit * 3, jar_id=jar_id)
 
-        if vec_rows:
-            emb_blobs = [r[8] for r in vec_rows]
-            sims = cosine_similarity(q_emb, emb_blobs)
-            vec_results = []
-            for r, sim in zip(vec_rows, sims):
-                vec_results.append({
-                    "id": r[0], "fqn": r[1], "kind": r[2], "name": r[3],
-                    "package": r[4], "summary": r[5], "description": r[6],
-                    "jar_path": r[7], "similarity": sim
-                })
-            vec_sorted = sorted(vec_results, key=lambda x: -x["similarity"])
-            vec_map = {r["fqn"]: (i, r) for i, r in enumerate(vec_sorted)}
-        else:
-            vec_map = {}
+        vec_map = {r["fqn"]: (i, r) for i, r in enumerate(vec_results)}
 
         all_fqns = set(fts_map.keys()) | set(vec_map.keys())
         fused = []
@@ -184,14 +170,12 @@ def build_app() -> FastMCP:
         jar_path = os.path.join(JARS_DIR, f"{file_hash}.jar")
         log.info(f"[do_index] file_hash={file_hash[:16]}..., jar_path={jar_path}")
 
-        # Check if file already exists on disk
         if os.path.exists(jar_path):
             log.warning(f"[do_index] Jar file already exists on disk: {jar_path}")
             existing = db.get_jar_by_hash(file_hash)
             if existing:
                 log.info(f"[do_index] Jar already indexed as '{existing['name']}' (id={existing['id']})")
                 return f"Jar already indexed as '{existing['name']}' (hash: {file_hash[:12]}...)"
-            # Stale file: exists on disk but not in DB -> auto-reindex
             log.warning(f"[do_index] Stale jar detected (file exists, no DB entry). Auto-reindexing as '{name}'.")
         else:
             log.info(f"[do_index] Writing {len(raw)} bytes to {jar_path}")
@@ -199,15 +183,13 @@ def build_app() -> FastMCP:
                 f.write(raw)
 
         log.info(f"[do_index] Starting background indexer.index_jar for {jar_path}")
-        count, error = await asyncio.to_thread(indexer.index_jar, jar_path, jar_name=name, file_hash=file_hash)
+        count, error = await indexer.index_jar(jar_path, jar_name=name, file_hash=file_hash)
         if error:
             log.error(f"[do_index] Indexing failed for '{name}': {error}. Cleaning up jar file and DB entry.")
-            # Clean up: remove DB entry if it was created
             old_entry = db.get_jar_by_name(name)
             if old_entry:
                 sym_count, _ = db.remove_jar(name)
                 log.info(f"[do_index] Cleaned up {sym_count} orphan symbols from DB for '{name}'")
-            # Clean up: remove jar file from disk
             if os.path.exists(jar_path):
                 os.remove(jar_path)
                 log.info(f"[do_index] Removed jar file from disk: {jar_path}")
@@ -267,6 +249,7 @@ def build_app() -> FastMCP:
             if j.get('error_message'):
                 lines.append(f"    error:   {j['error_message'][:100]}")
             lines.append("")
+
         return "\n".join(lines)
 
     async def upload_jar(request: Request) -> JSONResponse:
@@ -286,18 +269,15 @@ def build_app() -> FastMCP:
             log.error(f"[upload_jar] Empty file")
             return JSONResponse({"error": "Empty file"}, status_code=400)
 
-        # Parse name: prefer form field, fallback to filename
         if not name or name.strip() == "":
             name = jar_file.filename or "uploaded-jar"
             name = os.path.splitext(name)[0]
 
-        # Check if already indexed or already indexing
         existing = db.get_jar_by_name(name)
         if existing and existing.get("status") == "indexing":
             log.warning(f"[upload_jar] Jar '{name}' is already being indexed")
             return JSONResponse({"error": f"Jar '{name}' is already being indexed. Use jar_status to check progress."}, status_code=409)
 
-        # Check for duplicate hash
         file_hash = hashlib.sha256(raw).hexdigest()
         jar_path = os.path.join(JARS_DIR, f"{file_hash}.jar")
         existing_by_hash = db.get_jar_by_hash(file_hash)
@@ -305,7 +285,6 @@ def build_app() -> FastMCP:
             log.info(f"[upload_jar] Jar already indexed as '{existing_by_hash['name']}' (hash: {file_hash[:12]}...)")
             return JSONResponse({"error": f"Jar already indexed as '{existing_by_hash['name']}' (hash: {file_hash[:12]}...)"}, status_code=400)
 
-        # Start background indexing
         asyncio.create_task(do_index_async(raw, name))
         log.info(f"[upload_jar] Started background indexing for '{name}'")
 
@@ -322,7 +301,6 @@ def build_app() -> FastMCP:
 
     mcp_app = mcp.streamable_http_app()
 
-    # Add upload routes directly to the MCP app's router
     mcp_app.routes.append(Route("/upload-jar", upload_jar, methods=["POST"]))
     mcp_app.routes.append(Route("/upload-jar", upload_redirect, methods=["GET"]))
 

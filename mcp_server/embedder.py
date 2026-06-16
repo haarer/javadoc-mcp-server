@@ -1,68 +1,61 @@
 from __future__ import annotations
 import logging
-import struct
-import httpx
-from .config import EMBED_API_URL, EMBED_API_KEY, EMBED_MODEL, EMBED_BATCH_SIZE, EMBED_DIM
+import numpy as np
+import requests
+from .config import EMBED_API_URL, EMBED_API_KEY, EMBED_MODEL
 
 log = logging.getLogger("javadoc-mcp.embedder")
 
-_headers: dict[str, str] | None = None
-
-
-def _get_headers() -> dict[str, str]:
-    global _headers
-    if _headers is None:
-        _headers = {"Content-Type": "application/json"}
-        if EMBED_API_KEY:
-            _headers["Authorization"] = f"Bearer {EMBED_API_KEY}"
-    return _headers
-
-
-def _embed_batch_api(texts: list[str]) -> list[list[float]]:
-    payload = {"model": EMBED_MODEL, "input": texts}
-    resp = httpx.post(EMBED_API_URL, json=payload, headers=_get_headers(), timeout=60)
-    if resp.status_code == 500:
-        log.warning(f"[embedder] Got 500 from API, retrying with half batch size (splitting {len(texts)} into smaller batches)")
-        mid = len(texts) // 2
-        if mid == 0:
-            log.error(f"[embedder] Single text too large for API: {texts[0][:100]}...")
-            return []
-        return _embed_batch_api(texts[:mid]) + _embed_batch_api(texts[mid:])
-    resp.raise_for_status()
-    data = resp.json()
-    return [e["embedding"] for e in data["data"]]
-
 
 def embed_batch(texts: list[str]) -> list[bytes]:
-    """Embed a list of texts via OpenAPI endpoint, return list of packed float32 bytes."""
     if not texts:
         return []
-    all_embeddings: list[bytes] = []
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i:i + EMBED_BATCH_SIZE]
-        embs = _embed_batch_api(batch)
-        for emb in embs:
-            packed = struct.pack(f"{EMBED_DIM}f", *emb)
-            all_embeddings.append(packed)
-    return all_embeddings
+
+    try:
+        res = requests.post(EMBED_API_URL, json={
+            "model": EMBED_MODEL,
+            "input": texts,
+        }, headers=_headers(), timeout=(10, 60))
+        if res.status_code == 200:
+            return [np.array(d["embedding"], dtype=np.float32).tobytes() for d in res.json()["data"]]
+        log.warning(f"[embedder] Batch embed failed ({res.status_code}): {res.text[:200]}")
+    except Exception as e:
+        log.warning(f"[embedder] Batch embed error: {e}")
+
+    return [b""] * len(texts)
 
 
 def embed_single(text: str) -> bytes:
-    """Embed one text string."""
-    return embed_batch([text])[0]
+    try:
+        res = requests.post(EMBED_API_URL, json={
+            "model": EMBED_MODEL,
+            "input": text,
+        }, headers=_headers(), timeout=(10, 60))
+        res.raise_for_status()
+        return np.array(res.json()["data"][0]["embedding"], dtype=np.float32).tobytes()
+    except Exception as e:
+        log.warning(f"[embedder] Single embed failed: {e}")
+        return b""
 
 
-def cosine_similarity(query_blob: bytes, db_blobs: list[bytes | None]) -> list[float]:
-    """Compute cosine similarity between query and a list of DB embeddings."""
-    q = struct.unpack(f"{EMBED_DIM}f", query_blob)
+def _headers():
+    h = {"Content-Type": "application/json"}
+    if EMBED_API_KEY:
+        h["Authorization"] = f"Bearer {EMBED_API_KEY}"
+    return h
+
+
+def cosine_similarity(query: bytes, documents: list[bytes], dim: int = 1024) -> list[float]:
+    q = np.frombuffer(query, dtype=np.float32)
+    q_norm = np.linalg.norm(q)
+    if q_norm == 0:
+        return [0.0] * len(documents)
     scores = []
-    for b in db_blobs:
-        if not b or len(b) == 0:
+    for d_bytes in documents:
+        d = np.frombuffer(d_bytes, dtype=np.float32)
+        d_norm = np.linalg.norm(d)
+        if d_norm == 0:
             scores.append(0.0)
-            continue
-        if len(b) != EMBED_DIM * 4:
-            scores.append(0.0)
-            continue
-        d = struct.unpack(f"{EMBED_DIM}f", b)
-        scores.append(sum(qi * di for qi, di in zip(q, d)))
+        else:
+            scores.append(float(np.dot(q, d) / (q_norm * d_norm)))
     return scores

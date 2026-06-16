@@ -14,17 +14,19 @@ Python MCP server (Streamable HTTP transport) that indexes Javadoc JARs into SQL
 | Embeddings | OpenAPI-compatible `/v1/embeddings` endpoint (llama.cpp, OpenAI, vLLM, ...) |
 | Storage | SQLite + FTS5 |
 | JAR storage | SHA-256 hash as filename, user-facing name in DB |
+| Indexing | Async two-worker pipeline (parser + embedder) with bounded queue |
+| Embed failure | Fail-fast, zero-byte fallback, no retry loop |
 | MCP tools | lookup_symbol, search_docs, list_packages, list_classes, add_jar, remove_jar, list_jars, jar_status |
 
 ## Architecture
 
 ```
 mcp_server/
-  server.py          # MCP app, tool handlers, HTTP transport
-  indexer.py         # JAR extraction, HTML parsing, embedding pipeline
-  embedder.py        # HTTP client for OpenAPI embedding endpoint
+  server.py          # MCP app, tool handlers, HTTP transport, /upload-jar endpoint
+  indexer.py         # Async producer-consumer: parser worker + embedder worker
+  embedder.py        # HTTP client for OpenAPI embedding (fail-fast, short timeouts)
   database.py        # SQLite schema, FTS5, vector queries
-  parser.py          # BeautifulSoup Javadoc HTML -> structured data
+  parser.py          # BeautifulSoup Javadoc HTML -> structured data (all members)
   config.py          # Settings (port, index path, API URL, model, dim, RRF k)
 ```
 
@@ -55,6 +57,7 @@ CREATE TABLE symbols (
   summary TEXT,
   description TEXT,
   html_path TEXT,
+  source_jar TEXT,
   embedding BLOB
 );
 
@@ -68,46 +71,61 @@ CREATE UNIQUE INDEX idx_symbols_fqn ON symbols(fqn);
 
 ## Indexing flow
 
-1. `add_jar(name, content)` — base64-decoded, SHA-256 hash computed
-2. JAR saved to `JARS_DIR/{hash}.jar` (duplicate detection by hash)
-3. DB row inserted with `status='indexing'`, `symbols_indexed=0`
-4. `add_jar` returns immediately with `status: "indexing"`
-5. Background task runs indexing:
-   - Extract JAR to temp dir
-   - For each `*.html` file:
-     - Parse with BeautifulSoup
-     - Extract: class/interface name, package, members (fields, constructors, methods)
-     - Build FQN: `package.ClassName` for types, `package.ClassName#method(params)` for members
-     - Strip HTML tags -> plain text summary + description (truncated to 500 chars max)
-     - Generate embedding for `kind + fqn + summary + description` via OpenAPI endpoint
-     - Insert into `symbols`, trigger FTS5 update
-     - Every 100 files: `update_progress(jar_id, count)`
-   - On success: `finish_indexing(jar_id, total_count)`
-   - On failure: `finish_indexing(jar_id, count, error_msg)`
-   - Cleanup temp dir
+### Upload
 
-### Embedding pipeline notes
-- Texts are truncated before embedding (summary≤100, desc≤200, total≤500 chars) to avoid API token limits
-- Batch size: 8 (reduced from 64 to avoid 500 errors from embedding server)
-- On 500 error: recursive split-half retry until batch size = 1
-- Progress reported to DB every 100 files; final status on completion/failure
+1. `POST /upload-jar` — multipart form with `jar` (binary) and optional `name`
+2. SHA-256 hash computed, JAR stored at `JARS_DIR/{hash}.jar`
+3. Duplicate detection by hash (rejects same content) and name (replaces old JAR on re-upload)
+4. DB row inserted with `status='indexing'`, `symbols_indexed=0`
+5. Returns immediately with `status: "indexing"`
+
+### Background pipeline
+
+Two async workers run concurrently, connected by an `asyncio.Queue` (maxsize=8):
+
+**Parser worker:**
+1. Opens JAR via `zipfile.ZipFile`
+2. Iterates over all HTML files (except `_`-prefixed)
+3. For each: `parse_class_page(html, path, jar)` returns all symbols (class + methods + fields + constructors)
+4. Accumulates batches of `EMBED_BATCH_SIZE`, pushes to queue
+5. Sends empty-list sentinel when done
+
+**Embedder worker:**
+1. Pulls batches from queue
+2. Builds embedding text: `"{kind} {name} {package} {fqn} {signature} {summary} {description}"`
+3. Calls `embed_batch` via `asyncio.to_thread` — HTTP POST to embedding API
+4. On success: stores embeddings; on failure: stores zero bytes (fail-fast)
+5. Inserts all symbols + embeddings into `symbols` table in a single SQLite transaction
+6. Updates progress in `jars` table after each batch
+7. Yields to event loop with `asyncio.sleep(0)` after each batch
+
+Both workers run in the same event loop. CPU-bound parsing runs in `asyncio.to_thread`. The event loop remains responsive for serving MCP requests throughout indexing.
+
+### Completion
+
+- On success: `finish_indexing(jar_id, total_count)`
+- On failure (exception): `finish_indexing(jar_id, count, error_msg)`, JAR file removed
 
 ## Parser details
 
 Javadoc 21 HTML structure:
 - Class page: `class-declaration-page` body class
-- Class name: `<div class="block">` after class signature
-- Summary: `<div class="block">` in `<section class="class-description">`
-- Members: `#method-summary` table (`<div class="summary-table three-column-summary">`) with 3-column grid rows
-- Method anchors: `#method-name(params)` pattern in `<section class="detail">`
-- Detail sections: `<section class="method-details" id="method-detail">` (same for field, constructor)
+- Enum page: `enum-declaration-page` body class
+- Interface page: `interface-declaration-page` body class
+- Class name: `<h1>` text with prefix stripped
+- Class signature: `<div class="type-signature">`
+- Description: `<section class="class-description">` (or `<div class="description">`)
+- Members: `#method-summary`, `#field-summary`, `#constructor-summary` sections
+- Summary table: `<div class="summary-table">` with `div.col-second > a.member-name-link` rows
+- Member names in FQN: `ParentClass#memberName` (methods/fields), `ParentClass#<init>` (constructors)
+- Detail sections: `#method-detail`, `#field-detail`, `#constructor-detail` sections
 
-Parse per-symbol, not per-file. Each method/field/constructor gets own row.
+Parse per-class-page, returning all members as individual symbols.
 
 ## MCP Tools
 
 ### `lookup_symbol(fqn: str)`
-Exact match on `symbols.fqn`. Returns name, kind, package, signature, summary, description. If not found, suggests similar FQNs via FTS5.
+Exact match on `symbols.fqn`. Lookup supports both class FQN (`pkg.ClassName`) and member FQN (`pkg.ClassName#memberName`). Returns name, kind, package, signature, summary, description. If not found, suggests similar FQNs via FTS5.
 
 ### `search_docs(query: str, limit: int = 10, jar_filter: str = None)`
 Hybrid search:
@@ -122,8 +140,8 @@ Distinct packages. Optional JAR filter by name.
 ### `list_classes(package: str, jar_filter: str = None)`
 Classes/interfaces/enums in package. Optional JAR filter.
 
-### `add_jar(name: str, content: str)`
-Upload a JAR by base64-encoded content. File stored as `{sha256}.jar`. Duplicate detection by content hash. Returns immediately with `status: "indexing"`. Same-name re-upload replaces old JAR.
+### `add_jar(name: str)`
+Upload a JAR via the `/upload-jar` HTTP endpoint. Returns `status: "indexing"`. The MCP tool itself returns instructions to use the HTTP endpoint (MCP cannot transport binary data inline). Same-name re-upload replaces old JAR. Duplicate hash rejected.
 
 ### `remove_jar(name: str)`
 Remove a JAR and all its symbols by name. Deletes the stored file on disk. Cannot remove JARs currently indexing.
@@ -138,24 +156,26 @@ Check indexing status of a JAR. Returns `status` (`indexing`, `indexed`, `failed
 
 - External API: OpenAI-compatible `/v1/embeddings` endpoint
 - Default model: `bge-large-en-v1.5` via llama.cpp (1024 dim)
-- Embed at index time only, store as `struct.pack` floats -> BLOB
-- Query time: embed user query via same API, compute cosine similarity in Python
-- Batch embed up to 8 symbols per API call (reduced from 64 to avoid token limit)
-- Cosine similarity: pure Python dot product (no numpy dependency)
-- Recursive split-half retry on 500 errors
+- Embed at index time only, store as float32 BLOB
+- Query time: embed user query via `embed_single`, compute cosine similarity
+- Batch embed: up to `EMBED_BATCH_SIZE` (default 256) symbols per API call
+- Timeout: 10s connect + 60s read per batch
+- Fail-fast: any error returns zero-byte embeddings for the batch (no retries)
+- Cosine similarity: numpy dot product
 
 ## Dependencies
 
 ```
 mcp[streamable-http]    # MCP framework
 beautifulsoup4          # HTML parsing
-httpx                   # HTTP client for embedding API
+requests                # HTTP client for embedding API
+numpy                   # Vector math for embeddings
 sqlite3                 # stdlib, no install needed
 ```
 
 ## Performance targets
 
-- Index 4000-file JAR: < 120s (depends on embedding API throughput)
+- Index 4000-file JAR (~80k symbols): < 120s (depends on embedding API throughput)
 - Lookup symbol: < 50ms
 - Search query: < 500ms (includes embedding API call)
 - Memory: < 200MB during indexing
@@ -173,10 +193,12 @@ sqlite3                 # stdlib, no install needed
 
 ## Implemented features
 
-- Background indexing: `add_jar` returns immediately, indexing runs in background
-- Progress tracking: `jar_status` tool shows current status, symbol count, errors
-- Graceful query responses: search/lookup show "indexing in progress" note during indexing
-- Duplicate detection: same hash rejected; same-name re-upload replaces old JAR
-- Embedding resilience: text truncation, reduced batch size (8), recursive split on 500
-- Schema migration: safe ALTER TABLE adds `status`, `symbols_indexed`, `error_message` columns
-- Silent embedder: no per-call logging, only errors/warnings
+See README.md for current tool list and usage. Key implementation notes:
+
+- **Full symbol indexing**: all methods, fields, constructors indexed (not just classes)
+- **Background indexing**: async two-worker pipeline, server stays responsive
+- **Progress tracking**: `jar_status` tool shows status and symbol count
+- **Duplicate detection**: same hash rejected; same-name re-upload replaces old JAR
+- **Embedding resilience**: fail-fast with zero-byte fallback, 60s timeouts
+- **Pipeline backpressure**: bounded queue (maxsize=8) between parser and embedder
+- **HTTP upload**: binary JAR upload via multipart form POST to `/upload-jar`
