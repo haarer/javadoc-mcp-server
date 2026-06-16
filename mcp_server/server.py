@@ -17,6 +17,8 @@ from .indexer import Indexer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("javadoc-mcp")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").propagate = False
 
 
 def build_app() -> FastMCP:

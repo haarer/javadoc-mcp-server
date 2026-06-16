@@ -18,7 +18,6 @@ class Indexer:
 
     def index_jar(self, jar_path: str, jar_name: str | None = None, file_hash: str | None = None) -> tuple[int, str | None]:
         jar_path = os.path.abspath(jar_path)
-        log.info(f"[indexer] index_jar called: path={jar_path}, name={jar_name}, hash={file_hash}")
         if not zipfile.is_zipfile(jar_path):
             log.error(f"[indexer] Not a valid zip/jar: {jar_path}")
             return 0, f"Not a valid zip/jar: {jar_path}"
@@ -26,15 +25,12 @@ class Indexer:
         if jar_name is None:
             jar_name = os.path.splitext(os.path.basename(jar_path))[0]
 
-        log.info(f"[indexer] Adding jar to DB: name={jar_name}, hash={file_hash}")
         jar_id = self.db.add_jar(jar_name, jar_path, file_hash or "")
         if not jar_id:
             log.error(f"[indexer] Failed to register jar in DB")
             return 0, "Failed to register jar"
-        log.info(f"[indexer] Jar registered with jar_id={jar_id}")
 
         tmpdir = tempfile.mkdtemp(prefix="javadoc_index_")
-        log.info(f"[indexer] Extracting jar to tmpdir={tmpdir}")
         try:
             with zipfile.ZipFile(jar_path, "r") as zf:
                 zf.extractall(tmpdir)
@@ -57,18 +53,18 @@ class Indexer:
                 and "/legal/" not in str(f)
             ]
 
-            log.info(f"[indexer] Found {len(class_files)} class pages in {os.path.basename(jar_path)} (total html={len(html_files)}, skipped={len(html_files)-len(class_files)})")
-
             count = 0
             batch: list[tuple] = []
             batch_size = 256
             total_files = len(class_files)
             self.db.begin_indexing(jar_id)
 
+            # Accumulate symbols and texts across files for bulk embedding
+            pending_symbols: list = []
+            pending_texts: list[str] = []
+
             for idx, html_file in enumerate(class_files):
                 if (idx + 1) % 100 == 0 or idx == 0:
-                    pct = (idx + 1) / total_files * 100
-                    log.info(f"[indexer] Progress: {idx + 1}/{total_files} files ({pct:.0f}%), {count} symbols indexed so far")
                     self.db.update_progress(jar_id, count)
 
                 rel = str(html_file).replace(tmpdir, "").lstrip("/")
@@ -82,42 +78,47 @@ class Indexer:
                 if not symbols:
                     continue
 
-                log.debug(f"[indexer] Parsed {len(list(symbols))} symbols from {rel}")
-
                 symbols_list = list(symbols)
-                texts = []
                 for sym in symbols_list:
                     text = f"{sym.kind} {sym.fqn}"
                     if sym.summary:
                         text += f" {sym.summary[:100]}"
                     if sym.description:
                         text += f" {sym.description[:200]}"
-                    texts.append(text[:500])
+                    pending_symbols.append(sym)
+                    pending_texts.append(text[:500])
 
-                log.info(f"[indexer] Embedding {len(texts)} texts for {rel}")
-                embeddings = embed_batch(texts)
+                # Embed in bulk when we have enough
+                if len(pending_symbols) >= batch_size:
+                    embeddings = embed_batch(pending_texts)
+                    for sym, emb in zip(pending_symbols, embeddings):
+                        batch.append((
+                            jar_id, sym.fqn, sym.kind, sym.name, sym.package,
+                            sym.signature, sym.summary, sym.description,
+                            sym.html_path, sym.source_jar, emb
+                        ))
+                    self.db.insert_symbols_batch(jar_id, batch)
+                    count += len(batch)
+                    pending_symbols = []
+                    pending_texts = []
+                    batch = []
 
-                for sym, emb in zip(symbols_list, embeddings):
+            # Flush remaining
+            if pending_symbols:
+                embeddings = embed_batch(pending_texts)
+                for sym, emb in zip(pending_symbols, embeddings):
                     batch.append((
                         jar_id, sym.fqn, sym.kind, sym.name, sym.package,
                         sym.signature, sym.summary, sym.description,
                         sym.html_path, sym.source_jar, emb
                     ))
 
-                if len(batch) >= batch_size:
-                    log.info(f"[indexer] Flushing batch of {len(batch)} symbols to DB")
-                    self.db.insert_symbols_batch(jar_id, batch)
-                    count += len(batch)
-                    batch = []
-
             if batch:
-                log.info(f"[indexer] Flushing final batch of {len(batch)} symbols to DB")
                 self.db.insert_symbols_batch(jar_id, batch)
                 count += len(batch)
 
             self.db.conn.commit()
             self.db.finish_indexing(jar_id, count)
-            log.info(f"[indexer] Done indexing {jar_path}: {count} symbols total")
             return count, None
 
         except Exception as e:
@@ -128,14 +129,11 @@ class Indexer:
             try:
                 sym_count = self.db.conn.execute("SELECT count(*) FROM symbols WHERE jar_id = ?", (jar_id,)).fetchone()[0]
                 if sym_count > 0:
-                    log.warning(f"[indexer] Removing {sym_count} orphan symbols for jar_id={jar_id}")
                     self.db.conn.execute("DELETE FROM symbols WHERE jar_id = ?", (jar_id,))
                 self.db.conn.execute("DELETE FROM jars WHERE id = ?", (jar_id,))
                 self.db.conn.commit()
-                log.info(f"[indexer] Cleaned up partial DB state for jar_id={jar_id}")
             except Exception as cleanup_err:
                 log.error(f"[indexer] Cleanup failed for jar_id={jar_id}: {cleanup_err}")
             return 0, str(e)
         finally:
-            log.info(f"[indexer] Cleaning up tmpdir={tmpdir}")
             shutil.rmtree(tmpdir, ignore_errors=True)

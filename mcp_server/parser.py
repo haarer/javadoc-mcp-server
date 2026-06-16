@@ -129,7 +129,6 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     symbols.extend(constructors)
     symbols.extend(methods)
 
-    log.info(f"[parser] Parsed {len(symbols)} symbols from {fqn} ({kind}) in {html_path}")
     return symbols
 
 
