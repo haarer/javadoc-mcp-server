@@ -62,7 +62,7 @@ uv run javadoc-mcp
 ## Environment variables
 
 | Variable | Default | Description |
-|---|---|
+|---|---|---|
 | `JAVADOC_MCP_HOST` | `0.0.0.0` | Bind address |
 | `JAVADOC_MCP_PORT` | `8600` | Port |
 | `JAVADOC_INDEX_DIR` | `./data` | Index storage directory |
