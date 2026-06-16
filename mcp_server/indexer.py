@@ -16,7 +16,7 @@ class Indexer:
     def __init__(self, db: Database):
         self.db = db
 
-    def index_jar(self, jar_path: str, jar_name: str | None = None) -> tuple[int, str | None]:
+    def index_jar(self, jar_path: str, jar_name: str | None = None, file_hash: str | None = None) -> tuple[int, str | None]:
         jar_path = os.path.abspath(jar_path)
         if not zipfile.is_zipfile(jar_path):
             return 0, f"Not a valid zip/jar: {jar_path}"
@@ -24,7 +24,7 @@ class Indexer:
         if jar_name is None:
             jar_name = os.path.splitext(os.path.basename(jar_path))[0]
 
-        jar_id = self.db.add_jar(jar_name, jar_path)
+        jar_id = self.db.add_jar(jar_name, jar_path, file_hash or "")
         if not jar_id:
             return 0, "Failed to register jar"
 

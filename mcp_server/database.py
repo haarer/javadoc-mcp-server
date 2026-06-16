@@ -21,10 +21,13 @@ class Database:
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS jars (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
                 path TEXT NOT NULL,
+                file_hash TEXT UNIQUE,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jars_name ON jars(name);
 
             CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,9 +70,9 @@ class Database:
         """)
         self.conn.commit()
 
-    def add_jar(self, name: str, path: str) -> int:
+    def add_jar(self, name: str, path: str, file_hash: str) -> int:
         self.conn.execute(
-            "INSERT OR IGNORE INTO jars (name, path) VALUES (?, ?)", (name, path)
+            "INSERT OR IGNORE INTO jars (name, path, file_hash) VALUES (?, ?, ?)", (name, path, file_hash)
         )
         self.conn.commit()
         row = self.conn.execute("SELECT id FROM jars WHERE name = ?", (name,)).fetchone()
@@ -79,13 +82,22 @@ class Database:
         row = self.conn.execute("SELECT id FROM jars WHERE name = ?", (name,)).fetchone()
         return row[0] if row else None
 
-    def get_jar_by_name(self, name: str) -> dict[str, Any] | None:
+    def get_jar_by_hash(self, file_hash: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            "SELECT id, name, path, added_at FROM jars WHERE name = ?", (name,)
+            "SELECT id, name, path, file_hash, added_at FROM jars WHERE file_hash = ?", (file_hash,)
         ).fetchone()
         if not row:
             return None
-        cols = ["id", "name", "path", "added_at"]
+        cols = ["id", "name", "path", "file_hash", "added_at"]
+        return dict(zip(cols, row))
+
+    def get_jar_by_name(self, name: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT id, name, path, file_hash, added_at FROM jars WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return None
+        cols = ["id", "name", "path", "file_hash", "added_at"]
         return dict(zip(cols, row))
 
     def insert_symbols_batch(self, jar_id: int, rows: list[tuple]):
@@ -179,13 +191,13 @@ class Database:
 
     def list_jars(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            """SELECT j.id, j.name, j.path, j.added_at,
+            """SELECT j.id, j.name, j.path, j.file_hash, j.added_at,
                       (SELECT count(*) FROM symbols s WHERE s.jar_id = j.id) AS symbol_count
                FROM jars j
                ORDER BY j.added_at DESC"""
         ).fetchall()
         return [
-            {"id": r[0], "name": r[1], "path": r[2], "added_at": r[3], "symbol_count": r[4]}
+            {"id": r[0], "name": r[1], "path": r[2], "file_hash": r[3], "added_at": r[4], "symbol_count": r[5]}
             for r in rows
         ]
 
