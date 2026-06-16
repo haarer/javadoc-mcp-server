@@ -45,17 +45,3 @@ def _headers():
     return h
 
 
-def cosine_similarity(query: bytes, documents: list[bytes], dim: int = 1024) -> list[float]:
-    q = np.frombuffer(query, dtype=np.float32)
-    q_norm = np.linalg.norm(q)
-    if q_norm == 0:
-        return [0.0] * len(documents)
-    scores = []
-    for d_bytes in documents:
-        d = np.frombuffer(d_bytes, dtype=np.float32)
-        d_norm = np.linalg.norm(d)
-        if d_norm == 0:
-            scores.append(0.0)
-        else:
-            scores.append(float(np.dot(q, d) / (q_norm * d_norm)))
-    return scores

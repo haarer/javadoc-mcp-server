@@ -1,7 +1,6 @@
 from __future__ import annotations
 import logging
 import sqlite3
-import struct
 import os
 import re
 from typing import Any
@@ -38,6 +37,8 @@ class Database:
 
         self.has_vec = _load_vec_extension(self.conn)
         self._init_schema()
+        if self.has_vec:
+            self._init_vec_table()
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
         log.info(f"[database] Schema initialized, DB size={db_size} bytes, sqlite_vec={self.has_vec}")
 
@@ -98,13 +99,15 @@ class Database:
         for col in ["status", "symbols_indexed", "error_message"]:
             try:
                 self.conn.execute(f"ALTER TABLE jars ADD COLUMN {col} TEXT")
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
         # Ensure embedding column exists
         try:
             self.conn.execute("ALTER TABLE symbols ADD COLUMN embedding BLOB")
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
         self.conn.execute("""
             UPDATE jars SET status = CASE WHEN symbols_indexed > 0 THEN 'indexed'
                                           WHEN status IS NULL THEN 'indexed'
@@ -225,11 +228,19 @@ class Database:
         return dict(zip(cols, row))
 
     def fts_search(self, query: str, limit: int = 100) -> list[dict[str, Any]]:
-        terms = re.findall(r'[\w]+', query.lower())
+        terms = re.findall(r'[-\w]+', query.lower())
         if len(terms) > 1:
-            fts_query = " OR ".join(terms)
+            safe = []
+            for t in terms:
+                if t.upper() in ("AND", "OR", "NOT", "NEAR"):
+                    safe.append(f'"{t}"')
+                elif re.search(r'["*()+\-^]', t):
+                    safe.append(f'"{t}"')
+                else:
+                    safe.append(t)
+            fts_query = " OR ".join(safe) if safe else '""'
         else:
-            fts_query = query
+            fts_query = terms[0] if terms else query
         rows = self.conn.execute(
             """SELECT s.fqn, s.kind, s.name, s.package, s.summary, s.description,
                       j.path as jar_path, rank
@@ -250,20 +261,29 @@ class Database:
             return self._vector_search_vec(query_embedding, limit, jar_id)
         return self._vector_search_python(query_embedding, limit, jar_id)
 
-    def _vector_search_vec(self, query_embedding: bytes, limit: int, jar_id: int | None) -> list[dict[str, Any]]:
-        emb = struct.unpack(f"{EMBED_DIM}f", query_embedding)
-        emb_blob = struct.pack(f"{EMBED_DIM}f", *emb)
+    def _init_vec_table(self):
+        try:
+            self.conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS symbol_embeddings USING vec0(
+                    embedding float[{EMBED_DIM}] distance_metric=cosine
+                )
+            """)
+            log.info(f"[database] Created symbol_embeddings vec0 table (dim={EMBED_DIM})")
+        except Exception as e:
+            log.warning(f"[database] Failed to create vec0 table: {e}")
+            self.has_vec = False
 
+    def _vector_search_vec(self, query_embedding: bytes, limit: int, jar_id: int | None) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """SELECT s.id, s.fqn, s.kind, s.name, s.package, s.summary, s.description,
                       j.path as jar_path, v.distance
-               FROM symbol_embeddings v
-               JOIN symbols s ON v.rowid = s.id
-               JOIN jars j ON s.jar_id = j.id
-               WHERE v.embedding MATCH ?
-               ORDER BY v.distance
-               LIMIT ?""",
-            (emb_blob, limit)
+                FROM symbol_embeddings v
+                JOIN symbols s ON v.rowid = s.id
+                JOIN jars j ON s.jar_id = j.id
+                WHERE v.embedding MATCH ?
+                ORDER BY v.distance
+                LIMIT ?""",
+            (query_embedding, limit)
         ).fetchall()
         cols = ["id", "fqn", "kind", "name", "package", "summary", "description", "jar_path", "distance"]
         results = []

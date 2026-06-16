@@ -99,6 +99,14 @@ def parse_class_page(html: str, html_path: str, jar_path: str) -> list[Symbol]:
     type_sig_el = body.find("div", class_="type-signature")
     type_signature = type_sig_el.get_text(strip=True) if type_sig_el else None
 
+    pkg_el = body.find("section", class_="package")
+    if pkg_el:
+        pkg_text = pkg_el.get_text(strip=True)
+        for prefix in ("Package ", "Package"):
+            if pkg_text.startswith(prefix):
+                pkg_text = pkg_text[len(prefix):].strip()
+        if pkg_text:
+            package = pkg_text
     if not package:
         path_parts = html_path.replace(".html", "").split("/")
         if len(path_parts) > 1:

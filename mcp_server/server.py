@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 from .config import HOST, PORT, RRF_K, JARS_DIR, EMBED_API_URL, EMBED_MODEL, EMBED_DIM, EMBED_BATCH_SIZE, INDEX_PATH, INDEX_DIR
 from .database import Database
 from .indexer import Indexer
+from .embedder import embed_single
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("javadoc-mcp")
@@ -38,9 +39,6 @@ def build_app() -> FastMCP:
     )
     db = Database()
     indexer = Indexer(db)
-
-    mcp._db = db
-    mcp._indexer = indexer
 
     @mcp.tool()
     def lookup_symbol(fqn: str) -> str:
@@ -86,7 +84,6 @@ def build_app() -> FastMCP:
         if jar_filter:
             jar_id = db.get_jar_id(jar_filter)
 
-        from .embedder import embed_single
         q_emb = embed_single(query)
         vec_results = db.vector_search(q_emb, limit=limit * 3, jar_id=jar_id)
 
@@ -205,11 +202,11 @@ def build_app() -> FastMCP:
     @mcp.tool()
     def remove_jar(name: str) -> str:
         """Remove a previously indexed JAR and all its symbols. Cannot remove jars that are currently indexing."""
-        count, result = db.remove_jar(name)
+        count, jar_path = db.remove_jar(name)
         if count == 0:
-            return result if result else f"Jar not found: {name}"
-        if isinstance(result, str) and os.path.exists(result):
-            os.remove(result)
+            return jar_path if jar_path else f"Jar not found: {name}"
+        if jar_path and os.path.exists(jar_path):
+            os.remove(jar_path)
         return f"Removed {count} symbols from '{name}'"
 
     @mcp.tool()

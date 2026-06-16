@@ -33,8 +33,11 @@ class Indexer:
             parser_task = asyncio.create_task(self._parser_worker(jar_path, queue))
             embedder_task = asyncio.create_task(self._embedder_worker(jar_id, queue))
 
-            # Wait for both to finish
-            await parser_task
+            try:
+                await parser_task
+            except BaseException:
+                embedder_task.cancel()
+                raise
             count, failed = await embedder_task
 
             log.info(f"[indexer] Inserted {count} symbols, {failed} failed")
@@ -59,7 +62,7 @@ class Indexer:
             for idx, name in enumerate(html_files, 1):
                 try:
                     content = zf.read(name).decode('utf-8')
-                    page_symbols = parse_class_page(content, name, jar_path)
+                    page_symbols = await asyncio.to_thread(parse_class_page, content, name, jar_path)
                     if not page_symbols:
                         skipped += 1
                     else:
